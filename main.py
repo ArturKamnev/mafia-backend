@@ -5,7 +5,7 @@ from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
+from fastapi.middleware.cors import CORSMiddleware
 # ---------- МОДЕЛЬ ИГРЫ ----------
 
 def generate_code(length: int = 6) -> str:
@@ -96,7 +96,13 @@ class JoinRequest(BaseModel):
 
 
 app = FastAPI(title="Mafia Mini App API")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # можно потом ограничить своим доменом
+    allow_credentials=True,
+    allow_methods=["*"],        # разрешаем любые методы (GET, POST, OPTIONS и т.д.)
+    allow_headers=["*"],        # разрешаем любые заголовки
+)
 
 @app.get("/")
 def root():
