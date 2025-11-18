@@ -78,4 +78,167 @@ ROLE_DESCRIPTIONS = {
     "Мирный житель": "Голосует днем, пытается вычислить мафию.",
     "Мафия": "Убирает игрока ночью. Цель — остаться в большинстве.",
     "Детектив": "Каждую ночь проверяет игрока и узнает его роль.",
-    "Доктор": "Ночью лечит игрока
+    "Доктор": "Ночью лечит игрока, спасая его от устранения.",
+    "Офицер": "Может арестовать игрока один раз за игру, блокируя его ход.",
+    "Камикадзе": "При устранении забирает с собой одного мафиози.",
+    "Фантом": "Появляется как мирный, но один раз может избежать голосования.",
+    "Двойной агент": "Смотрит роль одного игрока и меняет сторону в зависимости от роли.",
+}
+
+
+# ---------- Pydantic-модели запросов ----------
+
+class HostRequest(BaseModel):
+    slots: int
+    roles: List[str]
+    host_id: int
+    host_name: str
+
+
+class JoinRequest(BaseModel):
+    user_id: int
+    name: str
+
+
+# ---------- ИНИЦИАЛИЗАЦИЯ FASTAPI ----------
+
+app = FastAPI(title="Mafia Mini App API")
+
+# CORS, чтобы фронт с другого домена мог ходить к API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # можно потом ограничить своим доменом
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Mafia backend is running"}
+
+
+# ---------- ЭНДПОИНТЫ ИГРЫ ----------
+
+@app.post("/api/games")
+def host_game(body: HostRequest):
+    """
+    Создать игру.
+    ОЖИДАЕТ ТЕЛО:
+    {
+      "slots": 6,
+      "roles": [...],
+      "host_id": 123,
+      "host_name": "Артур"
+    }
+    ВОЗВРАЩАЕТ:
+    {
+      "code": "...",
+      "slots": ...,
+      "roles": [...],
+      "host_id": ...,
+      "players": [
+        {"user_id": ..., "name": "..."},
+        ...
+      ]
+    }
+    """
+    if not 4 <= body.slots <= 12:
+        raise HTTPException(status_code=400, detail="Количество мест должно быть от 4 до 12")
+
+    allowed_roles = [role for role in body.roles if role in ROLE_DESCRIPTIONS]
+    if not allowed_roles:
+        allowed_roles = ["Мафия", "Детектив", "Доктор", "Мирный житель"]
+
+    game = registry.create(host_id=body.host_id, slots=body.slots, allowed_roles=allowed_roles)
+
+    # Хост автоматически добавляется как первый игрок
+    try:
+        game.join(body.host_id, body.host_name)
+    except ValueError:
+        pass
+
+    return {
+        "code": game.code,
+        "slots": game.slots,
+        "roles": game.allowed_roles,
+        "host_id": game.host_id,
+        "players": [{"user_id": p.user_id, "name": p.name} for p in game.players],
+    }
+
+
+@app.post("/api/games/{code}/join")
+def join_game(code: str, body: JoinRequest):
+    """
+    Присоединиться к игре.
+    ОЖИДАЕТ:
+    { "user_id": 987, "name": "Игрок" }
+    ВОЗВРАЩАЕТ:
+    {
+      "status": "joined",
+      "host_id": ...,
+      "players": [ {user_id, name}, ... ]
+    }
+    """
+    try:
+        game = registry.get(code)
+        game.join(body.user_id, body.name)
+        return {
+            "status": "joined",
+            "host_id": game.host_id,
+            "players": [{"user_id": p.user_id, "name": p.name} for p in game.players],
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/games/{code}/start")
+def start_game(code: str):
+    """
+    Запуск игры.
+    ВОЗВРАЩАЕТ:
+    {
+      "status": "started",
+      "assignments": { "123": "Мафия", "987": "Мирный житель", ... }
+    }
+    """
+    try:
+        game = registry.get(code)
+        game.start()
+        # Преобразуем ключи к строкам (на всякий случай)
+        assignments = {str(uid): role for uid, role in game.assignments.items()}
+        return {
+            "status": "started",
+            "assignments": assignments,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/games/{code}")
+def get_game(code: str):
+    """
+    Получить состояние игры (для лобби и списка игроков).
+    ВОЗВРАЩАЕТ:
+    {
+      "code": "...",
+      "slots": ...,
+      "roles": [...],
+      "host_id": ...,
+      "started": bool,
+      "players": [ {user_id, name}, ... ]
+    }
+    """
+    try:
+        game = registry.get(code)
+        return {
+            "code": game.code,
+            "slots": game.slots,
+            "roles": game.allowed_roles,
+            "host_id": game.host_id,
+            "started": game.started,
+            "players": [{"user_id": p.user_id, "name": p.name} for p in game.players],
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
