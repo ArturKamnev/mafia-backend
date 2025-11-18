@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-# ---------- МОДЕЛЬ ИГРЫ ----------
+from pydantic import BaseModel
+
+
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
 
 def generate_code(length: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -76,84 +78,4 @@ ROLE_DESCRIPTIONS = {
     "Мирный житель": "Голосует днем, пытается вычислить мафию.",
     "Мафия": "Убирает игрока ночью. Цель — остаться в большинстве.",
     "Детектив": "Каждую ночь проверяет игрока и узнает его роль.",
-    "Доктор": "Ночью лечит игрока, спасая его от устранения.",
-    "Офицер": "Может арестовать игрока один раз за игру, блокируя его ход.",
-    "Камикадзе": "При устранении забирает с собой одного мафиози.",
-    "Фантом": "Появляется как мирный, но один раз может избежать голосования.",
-    "Двойной агент": "Смотрит роль одного игрока и меняет сторону в зависимости от роли.",
-}
-
-# ---------- FASTAPI ----------
-
-class HostRequest(BaseModel):
-    slots: int
-    roles: List[str]
-
-
-class JoinRequest(BaseModel):
-    user_id: int
-    name: str
-
-
-app = FastAPI(title="Mafia Mini App API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],        # можно потом ограничить своим доменом
-    allow_credentials=True,
-    allow_methods=["*"],        # разрешаем любые методы (GET, POST, OPTIONS и т.д.)
-    allow_headers=["*"],        # разрешаем любые заголовки
-)
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Mafia backend is running"}
-
-
-@app.post("/api/games")
-def host_game(body: HostRequest):
-    if not 4 <= body.slots <= 12:
-        raise HTTPException(status_code=400, detail="Количество мест должно быть от 4 до 12")
-
-    allowed_roles = [role for role in body.roles if role in ROLE_DESCRIPTIONS]
-    if not allowed_roles:
-        allowed_roles = ["Мафия", "Детектив", "Доктор", "Мирный житель"]
-
-    game = registry.create(host_id=0, slots=body.slots, allowed_roles=allowed_roles)
-    return {"code": game.code, "slots": game.slots, "roles": game.allowed_roles}
-
-
-@app.post("/api/games/{code}/join")
-def join_game(code: str, body: JoinRequest):
-    try:
-        game = registry.get(code)
-        game.join(body.user_id, body.name)
-        return {"status": "joined", "players": [p.name for p in game.players]}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/games/{code}/start")
-def start_game(code: str):
-    try:
-        game = registry.get(code)
-        game.start()
-        return {
-            "status": "started",
-            "assignments": game.assignments,
-        }
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/api/games/{code}")
-def get_game(code: str):
-    try:
-        game = registry.get(code)
-        return {
-            "code": game.code,
-            "players": [p.name for p in game.players],
-            "started": game.started,
-            "roles": game.allowed_roles,
-        }
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    "Доктор": "Ночью лечит игрока
