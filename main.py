@@ -86,7 +86,7 @@ ROLE_DESCRIPTIONS = {
 }
 
 
-# ---------- Pydantic-модели запросов ----------
+# ---------- Pydantic-модели ----------
 
 class HostRequest(BaseModel):
     slots: int
@@ -100,14 +100,13 @@ class JoinRequest(BaseModel):
     name: str
 
 
-# ---------- ИНИЦИАЛИЗАЦИЯ FASTAPI ----------
+# ---------- FASTAPI ----------
 
 app = FastAPI(title="Mafia Mini App API")
 
-# CORS, чтобы фронт с другого домена мог ходить к API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # можно потом ограничить своим доменом
+    allow_origins=["*"],      # при желании потом ограничишь доменом фронта
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -119,29 +118,16 @@ def root():
     return {"status": "ok", "message": "Mafia backend is running"}
 
 
-# ---------- ЭНДПОИНТЫ ИГРЫ ----------
-
 @app.post("/api/games")
 def host_game(body: HostRequest):
     """
     Создать игру.
-    ОЖИДАЕТ ТЕЛО:
+    Ожидает:
     {
       "slots": 6,
       "roles": [...],
       "host_id": 123,
       "host_name": "Артур"
-    }
-    ВОЗВРАЩАЕТ:
-    {
-      "code": "...",
-      "slots": ...,
-      "roles": [...],
-      "host_id": ...,
-      "players": [
-        {"user_id": ..., "name": "..."},
-        ...
-      ]
     }
     """
     if not 4 <= body.slots <= 12:
@@ -153,7 +139,7 @@ def host_game(body: HostRequest):
 
     game = registry.create(host_id=body.host_id, slots=body.slots, allowed_roles=allowed_roles)
 
-    # Хост автоматически добавляется как первый игрок
+    # Хост сразу в лобби
     try:
         game.join(body.host_id, body.host_name)
     except ValueError:
@@ -164,7 +150,9 @@ def host_game(body: HostRequest):
         "slots": game.slots,
         "roles": game.allowed_roles,
         "host_id": game.host_id,
+        "started": game.started,
         "players": [{"user_id": p.user_id, "name": p.name} for p in game.players],
+        "assignments": {},  # при создании игры ролей ещё нет
     }
 
 
@@ -172,14 +160,8 @@ def host_game(body: HostRequest):
 def join_game(code: str, body: JoinRequest):
     """
     Присоединиться к игре.
-    ОЖИДАЕТ:
+    Ожидает:
     { "user_id": 987, "name": "Игрок" }
-    ВОЗВРАЩАЕТ:
-    {
-      "status": "joined",
-      "host_id": ...,
-      "players": [ {user_id, name}, ... ]
-    }
     """
     try:
         game = registry.get(code)
@@ -196,17 +178,12 @@ def join_game(code: str, body: JoinRequest):
 @app.post("/api/games/{code}/start")
 def start_game(code: str):
     """
-    Запуск игры.
-    ВОЗВРАЩАЕТ:
-    {
-      "status": "started",
-      "assignments": { "123": "Мафия", "987": "Мирный житель", ... }
-    }
+    Запустить игру: раздать роли всем игрокам.
+    Возвращает assignments (словарь user_id -> роль).
     """
     try:
         game = registry.get(code)
         game.start()
-        # Преобразуем ключи к строкам (на всякий случай)
         assignments = {str(uid): role for uid, role in game.assignments.items()}
         return {
             "status": "started",
@@ -219,19 +196,13 @@ def start_game(code: str):
 @app.get("/api/games/{code}")
 def get_game(code: str):
     """
-    Получить состояние игры (для лобби и списка игроков).
-    ВОЗВРАЩАЕТ:
-    {
-      "code": "...",
-      "slots": ...,
-      "roles": [...],
-      "host_id": ...,
-      "started": bool,
-      "players": [ {user_id, name}, ... ]
-    }
+    Получить текущее состояние игры / лобби.
+    Если игра уже запущена (started = True), отдаём assignments,
+    чтобы фронт мог показать роль текущего игрока.
     """
     try:
         game = registry.get(code)
+        assignments = {str(uid): role for uid, role in game.assignments.items()} if game.started else {}
         return {
             "code": game.code,
             "slots": game.slots,
@@ -239,6 +210,7 @@ def get_game(code: str):
             "host_id": game.host_id,
             "started": game.started,
             "players": [{"user_id": p.user_id, "name": p.name} for p in game.players],
+            "assignments": assignments,
         }
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
