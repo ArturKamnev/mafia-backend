@@ -1,3 +1,4 @@
+import os
 import json
 import secrets
 import string
@@ -8,29 +9,28 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+from openai import OpenAI  # библиотека openai v1
 
+# ==============
+#  OpenRouter client
+# ==============
 
-# ==========================
-#   МОДЕЛЬ MISTRAL 7B
-# ==========================
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY is not set")
 
-MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-model.eval()
-
+MODEL_NAME = "moonshotai/kimi-k2:free"
 ALLOWED_ACTIONS = ["vote", "kill", "heal", "check", "skip"]
 
 
-# ==========================
-#   ДАННЫЕ ИГРЫ
-# ==========================
+# ==============
+#  МОДЕЛЬ ИГРЫ
+# ==============
 
 def generate_code(length: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -41,7 +41,7 @@ def generate_code(length: int = 6) -> str:
 class Player:
     user_id: int
     name: str
-    is_bot: bool = False  # на будущее, чтобы различать ботов и людей
+    is_bot: bool = False
 
 
 @dataclass
@@ -109,9 +109,9 @@ ROLE_DESCRIPTIONS = {
 }
 
 
-# ==========================
-#   Pydantic-модели
-# ==========================
+# ==============
+#  Pydantic-схемы (под твой фронт)
+# ==============
 
 class HostRequest(BaseModel):
     slots: int
@@ -123,24 +123,24 @@ class HostRequest(BaseModel):
 class JoinRequest(BaseModel):
     user_id: int
     name: str
-    is_bot: bool = False  # можно будет создать бота с is_bot=true
+    is_bot: bool = False
 
 
 class BotTurnRequest(BaseModel):
-    user_id: int     # user_id бота
-    phase: str       # "day" или "night"
-    history: List[dict] = []  # массив событий/сообщений (по желанию)
+    user_id: int
+    phase: str           # "day" или "night"
+    history: List[dict] = []  # события/чат на будущее
 
 
-# ==========================
-#   ИНИЦИАЛИЗАЦИЯ FASTAPI
-# ==========================
+# ==============
+#  FastAPI app
+# ==============
 
-app = FastAPI(title="Mafia Mini App API + Mistral AI")
+app = FastAPI(title="Mafia Mini App + OpenRouter AI")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # потом можно ограничить доменом фронта
+    allow_origins=["*"],   # при желании можно ограничить доменом фронта
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -149,17 +149,14 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Mafia backend with Mistral is running"}
+    return {"status": "ok", "message": "Mafia backend with OpenRouter AI is running"}
 
 
-# ==========================
-#   AI ВСПОМОГАТЕЛЬНЫЕ
-# ==========================
+# ==============
+#  ЛОГИКА ДЛЯ AI-БОТОВ
+# ==============
 
 def serialize_game_state_for_ai(game: Game, acting_player_id: int, phase: str, history: List[dict]) -> dict:
-    """
-    Состояние игры для передачи в модель.
-    """
     my_role = game.assignments.get(acting_player_id)
     return {
         "game_code": game.code,
@@ -183,27 +180,24 @@ def serialize_game_state_for_ai(game: Game, acting_player_id: int, phase: str, h
 
 
 def build_ai_messages(game: Game, acting_player: Player, phase: str, history: List[dict]) -> List[dict]:
-    """
-    Формируем messages в формате chat для Mistral Instruct.
-    """
     state = serialize_game_state_for_ai(game, acting_player.user_id, phase, history)
     state_json = json.dumps(state, ensure_ascii=False, indent=2)
 
     system_content = (
         "Ты — игрок в настольной игре «Мафия». Ты управляешь одним персонажем.\n"
         "Тебе даётся текущее состояние игры в формате JSON: список игроков, фаза (день или ночь), "
-        "возможные роли и твоя роль (если она известна), а также история действий.\n\n"
+        "возможные роли и твоя роль, а также история действий.\n\n"
         "ТВОЯ ЗАДАЧА — выбрать ОДНО действие строго в формате JSON.\n"
-        "Формат ответа (строго один JSON-объект без текста вокруг):\n"
+        "Формат ответа (строго один JSON-объект, без текста вокруг):\n"
         "{\n"
         '  \"action\": \"vote\" | \"kill\" | \"heal\" | \"check\" | \"skip\",\n'
         "  \"target_id\": число или null,\n"
-        "  \"reason\": строка (1–2 предложения объяснения на любом языке)\n"
+        "  \"reason\": строка (1–2 предложения объяснения)\n"
         "}\n\n"
         "Правила:\n"
         "- Никакого текста вне JSON — ни приветствий, ни комментариев.\n"
-        "- Если ты не можешь выбрать цель, используй action=\"skip\" и target_id=null.\n"
-        "- Если у тебя роль мафии, ночью обычно используешь action=\"kill\".\n"
+        "- Если не можешь выбрать цель, используй action=\"skip\" и target_id=null.\n"
+        "- Если у тебя роль мафии ночью — обычно action=\"kill\".\n"
         "- Если ты детектив ночью — action=\"check\".\n"
         "- Если ты доктор ночью — action=\"heal\".\n"
         "- Днём чаще всего используется action=\"vote\".\n"
@@ -212,20 +206,16 @@ def build_ai_messages(game: Game, acting_player: Player, phase: str, history: Li
     user_content = (
         "Текущее состояние игры (JSON):\n"
         f"{state_json}\n\n"
-        "Сгенерируй ОДНО действие в описанном выше формате JSON."
+        "Сгенерируй ОДНО действие в описанном формате JSON."
     )
 
-    messages = [
+    return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content},
+        {"role": "user",  "content": user_content},
     ]
-    return messages
 
 
 def extract_json_from_text(text: str) -> dict:
-    """
-    Аккуратно вырезаем первый JSON-объект из ответа модели.
-    """
     first_brace = text.find("{")
     last_brace = text.rfind("}")
     if first_brace == -1 or last_brace == -1 or last_brace <= first_brace:
@@ -237,23 +227,18 @@ def extract_json_from_text(text: str) -> dict:
 def generate_ai_command(game: Game, acting_player: Player, phase: str, history: List[dict]) -> dict:
     messages = build_ai_messages(game, acting_player, phase, history)
 
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to(device)
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        extra_headers={
+            "HTTP-Referer": "https://projectmafia.onrender.com",
+            "X-Title": "Mafia Mini App",
+        },
+    )
 
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=128)
-
-    generated_ids = outputs[0][inputs["input_ids"].shape[-1]:]
-    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
+    text = completion.choices[0].message.content
     command = extract_json_from_text(text)
 
-    # простая валидация
     action = command.get("action")
     if action not in ALLOWED_ACTIONS:
         raise ValueError(f"Недопустимое действие от модели: {action}")
@@ -263,15 +248,12 @@ def generate_ai_command(game: Game, acting_player: Player, phase: str, history: 
     return command
 
 
-# ==========================
-#   ЭНДПОИНТЫ ИГРЫ
-# ==========================
+# ==============
+#  ЭНДПОИНТЫ ИГРЫ (под твой фронтенд)
+# ==============
 
 @app.post("/api/games")
 def host_game(body: HostRequest):
-    """
-    Создать игру (комнату).
-    """
     if not 4 <= body.slots <= 12:
         raise HTTPException(status_code=400, detail="Количество мест должно быть от 4 до 12")
 
@@ -281,7 +263,7 @@ def host_game(body: HostRequest):
 
     game = registry.create(host_id=body.host_id, slots=body.slots, allowed_roles=allowed_roles)
 
-    # хост сразу попадает в лобби
+    # хост сразу в лобби
     try:
         game.join(body.host_id, body.host_name, is_bot=False)
     except ValueError:
@@ -294,15 +276,12 @@ def host_game(body: HostRequest):
         "host_id": game.host_id,
         "started": game.started,
         "players": [{"user_id": p.user_id, "name": p.name, "is_bot": p.is_bot} for p in game.players],
-        "assignments": {},  # пока ролей нет
+        "assignments": {},  # роли появятся после /start
     }
 
 
 @app.post("/api/games/{code}/join")
 def join_game(code: str, body: JoinRequest):
-    """
-    Присоединиться к игре (человек или бот).
-    """
     try:
         game = registry.get(code)
         game.join(body.user_id, body.name, is_bot=body.is_bot)
@@ -317,9 +296,6 @@ def join_game(code: str, body: JoinRequest):
 
 @app.post("/api/games/{code}/start")
 def start_game(code: str):
-    """
-    Запустить игру и раздать роли.
-    """
     try:
         game = registry.get(code)
         game.start()
@@ -334,10 +310,6 @@ def start_game(code: str):
 
 @app.get("/api/games/{code}")
 def get_game(code: str):
-    """
-    Получить текущее состояние игры/лобби.
-    Если started=true, также отдаем assignments (роли).
-    """
     try:
         game = registry.get(code)
         assignments = {str(uid): role for uid, role in game.assignments.items()} if game.started else {}
@@ -358,8 +330,8 @@ def get_game(code: str):
 def bot_turn(code: str, body: BotTurnRequest):
     """
     Ход ИИ-бота.
-    Принимает user_id бота, фазу ('day'/'night') и историю.
-    Возвращает ОДНУ команду в виде JSON, которую можно применить на сервере.
+    Вход: user_id бота, phase ('day'/'night'), history (опционально).
+    Выход: одна команда: { action, target_id, reason }.
     """
     try:
         game = registry.get(code)
@@ -371,7 +343,6 @@ def bot_turn(code: str, body: BotTurnRequest):
         raise HTTPException(status_code=404, detail="Игрок не найден в этой игре")
 
     if not player.is_bot:
-        # можно снять это ограничение, если хочешь использовать ИИ и для людей
         raise HTTPException(status_code=400, detail="Этот игрок не помечен как бот (is_bot=false)")
 
     if not game.started:
@@ -382,8 +353,5 @@ def bot_turn(code: str, body: BotTurnRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ошибка при генерации хода ИИ: {exc}")
 
-    # Здесь можно потом добавить:
-    # apply_ai_command(game, player, command)
-    # и уже изменять game (убитые, голоса и т.д.)
-
+    # Пока просто возвращаем команду, не применяя к состоянию игры
     return {"command": command}
