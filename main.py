@@ -1,357 +1,646 @@
 import os
-import json
-import secrets
+import random
 import string
-from dataclasses import dataclass, field
-from typing import Dict, List
+import time
+from typing import Dict, List, Optional, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from openai import OpenAI  # библиотека openai v1
-
-# ==============
-#  OpenRouter client
-# ==============
-
+# ==========
+# OpenRouter (опционально, для ходов ботов через ИИ)
+# ==========
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise RuntimeError("OPENROUTER_API_KEY is not set")
-
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
-
-MODEL_NAME = "moonshotai/kimi-k2:free"
-ALLOWED_ACTIONS = ["vote", "kill", "heal", "check", "skip"]
-
-
-# ==============
-#  МОДЕЛЬ ИГРЫ
-# ==============
-
-def generate_code(length: int = 6) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+try:
+    from openai import OpenAI  # pip install openai
+    openrouter_client = (
+        OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+        if OPENROUTER_API_KEY
+        else None
+    )
+except ImportError:
+    openrouter_client = None
 
 
-@dataclass
-class Player:
+# ==========
+# Модельки
+# ==========
+
+class Player(BaseModel):
     user_id: int
     name: str
     is_bot: bool = False
+    alive: bool = True
 
 
-@dataclass
-class Game:
-    code: str
-    host_id: int
-    slots: int
-    allowed_roles: List[str]
-    started: bool = False
-    players: List[Player] = field(default_factory=list)
-    assignments: Dict[int, str] = field(default_factory=dict)  # user_id -> role
-
-    def join(self, user_id: int, name: str, is_bot: bool = False) -> None:
-        if self.started:
-            raise ValueError("Игра уже началась")
-        if any(p.user_id == user_id for p in self.players):
-            raise ValueError("Вы уже в игре")
-        if len(self.players) >= self.slots:
-            raise ValueError("Все места заняты")
-        self.players.append(Player(user_id=user_id, name=name, is_bot=is_bot))
-
-    def start(self) -> None:
-        if self.started:
-            raise ValueError("Игра уже началась")
-        if len(self.players) < 4:
-            raise ValueError("Нужно минимум 4 игрока")
-        self.started = True
-        pool = self.allowed_roles.copy()
-        while len(pool) < len(self.players):
-            pool.append("Мирный житель")
-        rng = secrets.SystemRandom()
-        rng.shuffle(pool)
-        for player, role in zip(self.players, pool):
-            self.assignments[player.user_id] = role
-
-
-class GameRegistry:
-    def __init__(self) -> None:
-        self.games: Dict[str, Game] = {}
-
-    def create(self, host_id: int, slots: int, allowed_roles: List[str]) -> Game:
-        code = generate_code()
-        game = Game(code=code, host_id=host_id, slots=slots, allowed_roles=allowed_roles)
-        self.games[code] = game
-        return game
-
-    def get(self, code: str) -> Game:
-        try:
-            return self.games[code]
-        except KeyError:
-            raise ValueError("Игра не найдена")
-
-
-registry = GameRegistry()
-
-ROLE_DESCRIPTIONS = {
-    "Мирный житель": "Голосует днем, пытается вычислить мафию.",
-    "Мафия": "Убирает игроков ночью. Цель — остаться в большинстве.",
-    "Детектив": "Каждую ночь проверяет игрока и узнает его роль.",
-    "Доктор": "Ночью лечит игрока, спасая его от устранения.",
-    "Офицер": "Может арестовать игрока один раз за игру, блокируя его ход.",
-    "Камикадзе": "При устранении забирает с собой одного мафиози.",
-    "Фантом": "Появляется как мирный, но один раз может избежать голосования.",
-    "Двойной агент": "Смотрит роль одного игрока и меняет сторону в зависимости от роли.",
-}
-
-
-# ==============
-#  Pydantic-схемы (под твой фронт)
-# ==============
-
-class HostRequest(BaseModel):
-    slots: int
+class CreateGameRequest(BaseModel):
+    slots: int = Field(ge=4, le=12)
     roles: List[str]
     host_id: int
     host_name: str
 
 
-class JoinRequest(BaseModel):
+class JoinGameRequest(BaseModel):
     user_id: int
     name: str
     is_bot: bool = False
 
 
-class BotTurnRequest(BaseModel):
+class ActionRequest(BaseModel):
     user_id: int
-    phase: str           # "day" или "night"
-    history: List[dict] = []  # события/чат на будущее
+    action: str  # "kill" | "check" | "heal" | "vote"
+    target_id: Optional[int] = None
 
 
-# ==============
-#  FastAPI app
-# ==============
+class ChatMessageIn(BaseModel):
+    user_id: int
+    name: str
+    text: str
 
-app = FastAPI(title="Mafia Mini App + OpenRouter AI")
+
+# Структура игры в памяти (держим как dict)
+GameState = Dict[str, Any]
+
+games: Dict[str, GameState] = {}
+
+# ==========
+# FastAPI app
+# ==========
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # при желании можно ограничить доменом фронта
+    allow_origins=["*"],  # при желании можешь ограничить доменом фронта
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Mafia backend with OpenRouter AI is running"}
+# ==========
+# helpers
+# ==========
+
+def generate_code(length: int = 6) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        code = "".join(random.choices(alphabet, k=length))
+        if code not in games:
+            return code
 
 
-# ==============
-#  ЛОГИКА ДЛЯ AI-БОТОВ
-# ==============
-
-def serialize_game_state_for_ai(game: Game, acting_player_id: int, phase: str, history: List[dict]) -> dict:
-    my_role = game.assignments.get(acting_player_id)
+def game_summary(game: GameState) -> Dict[str, Any]:
+    """То, что возвращаем фронту в /api/games и других местах."""
     return {
-        "game_code": game.code,
-        "phase": phase,
-        "host_id": game.host_id,
-        "started": game.started,
-        "slots": game.slots,
-        "roles_in_game": game.allowed_roles,
-        "players": [
-            {
-                "user_id": p.user_id,
-                "name": p.name,
-                "is_bot": p.is_bot,
-            }
-            for p in game.players
-        ],
-        "acting_player_id": acting_player_id,
-        "acting_player_role": my_role,
-        "history": history,
+        "code": game["code"],
+        "slots": game["slots"],
+        "roles": game["roles"],
+        "host_id": game["host_id"],
+        "players": game["players"],
+        "assignments": game.get("assignments", {}),
+        "started": game.get("started", False),
+        "phase": game.get("phase", "lobby"),
+        "round": game.get("round", 1),
+        "current_actor_id": game.get("current_actor_id"),
+        "events": game.get("events", []),
     }
 
 
-def build_ai_messages(game: Game, acting_player: Player, phase: str, history: List[dict]) -> List[dict]:
-    state = serialize_game_state_for_ai(game, acting_player.user_id, phase, history)
-    state_json = json.dumps(state, ensure_ascii=False, indent=2)
+def get_game_or_404(code: str) -> GameState:
+    game = games.get(code)
+    if not game:
+        raise HTTPException(status_code=404, detail="Игра не найдена")
+    return game
 
-    system_content = (
-        "Ты — игрок в настольной игре «Мафия». Ты управляешь одним персонажем.\n"
-        "Тебе даётся текущее состояние игры в формате JSON: список игроков, фаза (день или ночь), "
-        "возможные роли и твоя роль, а также история действий.\n\n"
-        "ТВОЯ ЗАДАЧА — выбрать ОДНО действие строго в формате JSON.\n"
-        "Формат ответа (строго один JSON-объект, без текста вокруг):\n"
-        "{\n"
-        '  \"action\": \"vote\" | \"kill\" | \"heal\" | \"check\" | \"skip\",\n'
-        "  \"target_id\": число или null,\n"
-        "  \"reason\": строка (1–2 предложения объяснения)\n"
-        "}\n\n"
-        "Правила:\n"
-        "- Никакого текста вне JSON — ни приветствий, ни комментариев.\n"
-        "- Если не можешь выбрать цель, используй action=\"skip\" и target_id=null.\n"
-        "- Если у тебя роль мафии ночью — обычно action=\"kill\".\n"
-        "- Если ты детектив ночью — action=\"check\".\n"
-        "- Если ты доктор ночью — action=\"heal\".\n"
-        "- Днём чаще всего используется action=\"vote\".\n"
-    )
 
-    user_content = (
-        "Текущее состояние игры (JSON):\n"
-        f"{state_json}\n\n"
-        "Сгенерируй ОДНО действие в описанном формате JSON."
-    )
+def get_player(game: GameState, user_id: int) -> Player:
+    for p in game["players"]:
+        if p["user_id"] == user_id:
+            return p
+    raise HTTPException(status_code=404, detail="Игрок не найден в этой игре")
 
-    return [
-        {"role": "system", "content": system_content},
-        {"role": "user",  "content": user_content},
+
+def get_alive_players(game: GameState) -> List[Player]:
+    return [p for p in game["players"] if p.get("alive", True)]
+
+
+def get_first_alive_with_role(game: GameState, role_name: str) -> Optional[Player]:
+    assignments: Dict[str, str] = game.get("assignments", {})
+    for uid_str, role in assignments.items():
+        if role != role_name:
+            continue
+        uid = int(uid_str)
+        for p in game["players"]:
+            if p["user_id"] == uid and p.get("alive", True):
+                return p
+    return None
+
+
+def ensure_basic_roles(roles: List[str]) -> List[str]:
+    roles = roles[:]  # копия
+    if "Мафия" not in roles:
+        roles.append("Мафия")
+    if "Мирный житель" not in roles:
+        roles.append("Мирный житель")
+    return roles
+
+
+def assign_roles(game: GameState) -> Dict[str, str]:
+    players = game["players"]
+    roles_pool = ensure_basic_roles(game["roles"])
+    assignments: Dict[str, str] = {}
+
+    if not players:
+        return assignments
+
+    # гарантируем хотя бы одну мафию
+    mafia_player = random.choice(players)
+    assignments[str(mafia_player["user_id"])] = "Мафия"
+
+    # остальным рандом по списку ролей
+    for p in players:
+        uid_str = str(p["user_id"])
+        if uid_str in assignments:
+            continue
+        role = random.choice(roles_pool)
+        assignments[uid_str] = role
+
+    # гарантируем хотя бы одного мирного
+    if "Мирный житель" not in assignments.values():
+        non_mafia = [uid for uid, r in assignments.items() if r != "Мафия"]
+        if non_mafia:
+            uid_to_fix = random.choice(non_mafia)
+            assignments[uid_to_fix] = "Мирный житель"
+
+    return assignments
+
+
+def start_night(game: GameState):
+    """Перевод дня в ночь. Вызывается, например, из /bot-turn, когда фаза = day."""
+    game["night_state"] = {
+        "kill_target": None,
+        "heal_target": None,
+        "detective_target": None,
+    }
+
+    mafia = get_first_alive_with_role(game, "Мафия")
+    detective = get_first_alive_with_role(game, "Детектив")
+    doctor = get_first_alive_with_role(game, "Доктор")
+
+    if mafia:
+        game["phase"] = "night_mafia"
+        game["current_actor_id"] = mafia["user_id"]
+        return
+
+    if detective:
+        game["phase"] = "night_detective"
+        game["current_actor_id"] = detective["user_id"]
+        return
+
+    if doctor:
+        game["phase"] = "night_doctor"
+        game["current_actor_id"] = doctor["user_id"]
+        return
+
+    # никого нет – ночь ничего не делает, сразу новый день
+    resolve_night_and_go_day(game)
+
+
+def goto_next_phase_after_mafia(game: GameState):
+    detective = get_first_alive_with_role(game, "Детектив")
+    doctor = get_first_alive_with_role(game, "Доктор")
+
+    if detective:
+        game["phase"] = "night_detective"
+        game["current_actor_id"] = detective["user_id"]
+    elif doctor:
+        game["phase"] = "night_doctor"
+        game["current_actor_id"] = doctor["user_id"]
+    else:
+        resolve_night_and_go_day(game)
+
+
+def goto_next_phase_after_detective(game: GameState):
+    doctor = get_first_alive_with_role(game, "Доктор")
+    if doctor:
+        game["phase"] = "night_doctor"
+        game["current_actor_id"] = doctor["user_id"]
+    else:
+        resolve_night_and_go_day(game)
+
+
+def resolve_night_and_go_day(game: GameState):
+    """Рассчитываем итог ночи и переходим ко дню."""
+    night_state = game.get("night_state", {})
+    kill_target = night_state.get("kill_target")
+    heal_target = night_state.get("heal_target")
+    detective_target = night_state.get("detective_target")
+
+    events: List[Dict[str, Any]] = []
+
+    if detective_target is not None:
+        # Можно добавить флаг is_mafia, если захочешь учесть это позже
+        events.append({"type": "checked", "user_id": detective_target})
+
+    if kill_target is not None:
+        if heal_target == kill_target:
+            events.append({"type": "healed", "user_id": kill_target})
+        else:
+            # убиваем игрока
+            try:
+                victim = get_player(game, kill_target)
+                victim["alive"] = False
+            except HTTPException:
+                pass
+            events.append({"type": "killed", "user_id": kill_target})
+
+    game["events"] = events
+    game["phase"] = "day"
+    game["round"] = game.get("round", 1) + 1
+    game["current_actor_id"] = None
+    game["night_state"] = {}
+
+
+def random_bot_action(game: GameState, bot_player: Player) -> Optional[Dict[str, Any]]:
+    """Простейшее поведение бота, если нет OpenRouter."""
+    phase = game.get("phase")
+    alive_players = get_alive_players(game)
+    # выбираем цели только среди живых, не самого себя
+    candidates = [p for p in alive_players if p["user_id"] != bot_player["user_id"]]
+    if not candidates:
+        return None
+
+    target = random.choice(candidates)
+    if phase == "night_mafia":
+        return {"action": "kill", "target_id": target["user_id"]}
+    if phase == "night_detective":
+        return {"action": "check", "target_id": target["user_id"]}
+    if phase == "night_doctor":
+        # доктор может лечить и самого себя, но для простоты иногда лечит себя, иногда другого
+        if random.random() < 0.4:
+            return {"action": "heal", "target_id": bot_player["user_id"]}
+        return {"action": "heal", "target_id": target["user_id"]}
+
+    return None
+
+
+def build_ai_prompt_for_bot(game: GameState, bot_player: Player) -> str:
+    """Промпт для OpenRouter: отдаём состояние и что хотим получить."""
+    assignments: Dict[str, str] = game.get("assignments", {})
+    role = assignments.get(str(bot_player["user_id"]), "Мирный житель")
+    phase = game.get("phase")
+    alive_players = get_alive_players(game)
+
+    summary_players = [
+        {
+            "user_id": p["user_id"],
+            "name": p["name"],
+            "is_bot": p.get("is_bot", False),
+            "alive": p.get("alive", True),
+        }
+        for p in alive_players
     ]
 
-
-def extract_json_from_text(text: str) -> dict:
-    first_brace = text.find("{")
-    last_brace = text.rfind("}")
-    if first_brace == -1 or last_brace == -1 or last_brace <= first_brace:
-        raise ValueError("Модель не вернула корректный JSON.")
-    json_str = text[first_brace:last_brace + 1]
-    return json.loads(json_str)
-
-
-def generate_ai_command(game: Game, acting_player: Player, phase: str, history: List[dict]) -> dict:
-    messages = build_ai_messages(game, acting_player, phase, history)
-
-    completion = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        extra_headers={
-            "HTTP-Referer": "https://projectmafia.onrender.com",
-            "X-Title": "Mafia Mini App",
-        },
+    return (
+        "You are an AI agent playing the game Mafia.\n"
+        f"Your role: {role}.\n"
+        f"Current phase: {phase}.\n"
+        "You see the list of alive players (including yourself):\n"
+        f"{summary_players}\n\n"
+        "Your task: choose exactly ONE action as a JSON object with keys 'action' and 'target_id'.\n"
+        "Allowed actions:\n"
+        "- if phase == 'night_mafia': action must be 'kill'.\n"
+        "- if phase == 'night_detective': action must be 'check'.\n"
+        "- if phase == 'night_doctor': action must be 'heal'.\n"
+        "Choose any valid target_id from alive players.\n\n"
+        "Return ONLY JSON, without explanations, like:\n"
+        "{\"action\": \"kill\", \"target_id\": 123}\n"
     )
 
-    text = completion.choices[0].message.content
-    command = extract_json_from_text(text)
 
-    action = command.get("action")
-    if action not in ALLOWED_ACTIONS:
-        raise ValueError(f"Недопустимое действие от модели: {action}")
-    if "target_id" not in command:
-        raise ValueError("В ответе ИИ нет поля target_id.")
+def ai_bot_action(game: GameState, bot_player: Player) -> Optional[Dict[str, Any]]:
+    """Ход бота через OpenRouter; если не получилось – fallback на random_bot_action."""
+    if not openrouter_client:
+        return random_bot_action(game, bot_player)
 
-    return command
+    try:
+        prompt = build_ai_prompt_for_bot(game, bot_player)
+        completion = openrouter_client.chat.completions.create(
+            model="moonshotai/kimi-k2:free",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        )
+        content = completion.choices[0].message.content
+        # Пытаемся распарсить JSON, даже если модель вернула лишний текст
+        import json
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end == -1:
+            return random_bot_action(game, bot_player)
+        obj = json.loads(content[start : end + 1])
+        action = obj.get("action")
+        target_id = obj.get("target_id")
+        if action in ("kill", "check", "heal") and isinstance(target_id, int):
+            return {"action": action, "target_id": target_id}
+        return random_bot_action(game, bot_player)
+    except Exception:
+        # Любая ошибка – просто рандом
+        return random_bot_action(game, bot_player)
 
 
-# ==============
-#  ЭНДПОИНТЫ ИГРЫ (под твой фронтенд)
-# ==============
+# ==========
+# Endpoints
+# ==========
 
 @app.post("/api/games")
-def host_game(body: HostRequest):
-    if not 4 <= body.slots <= 12:
-        raise HTTPException(status_code=400, detail="Количество мест должно быть от 4 до 12")
-
-    allowed_roles = [role for role in body.roles if role in ROLE_DESCRIPTIONS]
-    if not allowed_roles:
-        allowed_roles = ["Мафия", "Детектив", "Доктор", "Мирный житель"]
-
-    game = registry.create(host_id=body.host_id, slots=body.slots, allowed_roles=allowed_roles)
-
-    # хост сразу в лобби
-    try:
-        game.join(body.host_id, body.host_name, is_bot=False)
-    except ValueError:
-        pass
-
-    return {
-        "code": game.code,
-        "slots": game.slots,
-        "roles": game.allowed_roles,
-        "host_id": game.host_id,
-        "started": game.started,
-        "players": [{"user_id": p.user_id, "name": p.name, "is_bot": p.is_bot} for p in game.players],
-        "assignments": {},  # роли появятся после /start
+def create_game(req: CreateGameRequest):
+    code = generate_code()
+    game: GameState = {
+        "code": code,
+        "slots": req.slots,
+        "roles": req.roles or ["Мафия", "Мирный житель"],
+        "host_id": req.host_id,
+        "players": [
+            {
+                "user_id": req.host_id,
+                "name": req.host_name,
+                "is_bot": False,
+                "alive": True,
+            }
+        ],
+        "assignments": {},
+        "started": False,
+        "phase": "lobby",
+        "round": 1,
+        "current_actor_id": None,
+        "events": [],
+        "chat": [],
+        "night_state": {},
     }
+    games[code] = game
+    return game_summary(game)
 
 
 @app.post("/api/games/{code}/join")
-def join_game(code: str, body: JoinRequest):
-    try:
-        game = registry.get(code)
-        game.join(body.user_id, body.name, is_bot=body.is_bot)
-        return {
-            "status": "joined",
-            "host_id": game.host_id,
-            "players": [{"user_id": p.user_id, "name": p.name, "is_bot": p.is_bot} for p in game.players],
-        }
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+def join_game(code: str, req: JoinGameRequest):
+    game = get_game_or_404(code)
 
+    if game.get("started"):
+        raise HTTPException(status_code=400, detail="Игра уже началась")
 
-@app.post("/api/games/{code}/start")
-def start_game(code: str):
-    try:
-        game = registry.get(code)
-        game.start()
-        assignments = {str(uid): role for uid, role in game.assignments.items()}
-        return {
-            "status": "started",
-            "assignments": assignments,
+    if len(game["players"]) >= game["slots"]:
+        raise HTTPException(status_code=400, detail="Лобби заполнено")
+
+    # если этот user_id уже есть – просто обновляем имя/флаг
+    for p in game["players"]:
+        if p["user_id"] == req.user_id:
+            p["name"] = req.name
+            p["is_bot"] = req.is_bot
+            p["alive"] = True
+            return game_summary(game)
+
+    game["players"].append(
+        {
+            "user_id": req.user_id,
+            "name": req.name,
+            "is_bot": req.is_bot,
+            "alive": True,
         }
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    )
+
+    return game_summary(game)
 
 
 @app.get("/api/games/{code}")
 def get_game(code: str):
-    try:
-        game = registry.get(code)
-        assignments = {str(uid): role for uid, role in game.assignments.items()} if game.started else {}
+    game = get_game_or_404(code)
+    return game_summary(game)
+
+
+@app.post("/api/games/{code}/start")
+def start_game(code: str):
+    game = get_game_or_404(code)
+
+    if game.get("started"):
+        # Идемпотентно – просто возвращаем текущее состояние
         return {
-            "code": game.code,
-            "slots": game.slots,
-            "roles": game.allowed_roles,
-            "host_id": game.host_id,
-            "started": game.started,
-            "players": [{"user_id": p.user_id, "name": p.name, "is_bot": p.is_bot} for p in game.players],
-            "assignments": assignments,
+            "code": code,
+            "assignments": game["assignments"],
+            "phase": game["phase"],
+            "round": game["round"],
+            "events": game["events"],
+            "players": game["players"],
+            "host_id": game["host_id"],
+            "started": True,
+            "slots": game["slots"],
         }
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+
+    if len(game["players"]) < 4:
+        raise HTTPException(status_code=400, detail="Нужно минимум 4 игрока")
+
+    assignments = assign_roles(game)
+    game["assignments"] = assignments
+    game["started"] = True
+    # Начинаем с дня (как ты хотел)
+    game["phase"] = "day"
+    game["round"] = 1
+    game["current_actor_id"] = None
+    game["events"] = []
+    game["night_state"] = {}
+
+    return {
+        "code": code,
+        "assignments": assignments,
+        "phase": game["phase"],
+        "round": game["round"],
+        "events": game["events"],
+        "players": game["players"],
+        "host_id": game["host_id"],
+        "started": True,
+        "slots": game["slots"],
+    }
+
+
+@app.post("/api/games/{code}/action")
+def game_action(code: str, req: ActionRequest):
+    game = get_game_or_404(code)
+
+    if not game.get("started"):
+        raise HTTPException(status_code=400, detail="Игра ещё не началась")
+
+    player = get_player(game, req.user_id)
+    if not player.get("alive", True):
+        raise HTTPException(status_code=400, detail="Мёртвые не ходят 🙂")
+
+    phase = game.get("phase", "day")
+    assignments: Dict[str, str] = game.get("assignments", {})
+    role = assignments.get(str(req.user_id))
+
+    if phase == "day":
+        # Днём просто фиксим факт голосования (без логики вылета)
+        if req.action == "vote" and req.target_id is not None:
+            game["events"].append(
+                {"type": "voted", "user_id": req.user_id, "target_id": req.target_id}
+            )
+        return {"ok": True}
+
+    if phase == "night_mafia":
+        if role != "Мафия":
+            raise HTTPException(status_code=403, detail="Ход мафии, но вы не мафия")
+        if game.get("current_actor_id") not in (None, req.user_id):
+            raise HTTPException(status_code=403, detail="Сейчас ход другого игрока")
+        if req.action != "kill" or req.target_id is None:
+            raise HTTPException(status_code=400, detail="Ожидалось действие 'kill' с target_id")
+        get_player(game, req.target_id)  # проверим, что цель существует
+        # просто запоминаем цель, но не убиваем сейчас
+        game.setdefault("night_state", {})["kill_target"] = req.target_id
+        # после мафии идём к детективу/доктору/дню
+        goto_next_phase_after_mafia(game)
+        return {"ok": True}
+
+    if phase == "night_detective":
+        if role != "Детектив":
+            raise HTTPException(status_code=403, detail="Ход детектива, но вы не детектив")
+        if game.get("current_actor_id") not in (None, req.user_id):
+            raise HTTPException(status_code=403, detail="Сейчас ход другого игрока")
+        if req.action != "check" or req.target_id is None:
+            raise HTTPException(status_code=400, detail="Ожидалось действие 'check' с target_id")
+
+        get_player(game, req.target_id)
+        game.setdefault("night_state", {})["detective_target"] = req.target_id
+        goto_next_phase_after_detective(game)
+        return {"ok": True}
+
+    if phase == "night_doctor":
+        if role != "Доктор":
+            raise HTTPException(status_code=403, detail="Ход доктора, но вы не доктор")
+        if game.get("current_actor_id") not in (None, req.user_id):
+            raise HTTPException(status_code=403, detail="Сейчас ход другого игрока")
+        if req.action != "heal" or req.target_id is None:
+            raise HTTPException(status_code=400, detail="Ожидалось действие 'heal' с target_id")
+
+        get_player(game, req.target_id)
+        game.setdefault("night_state", {})["heal_target"] = req.target_id
+        resolve_night_and_go_day(game)
+        return {"ok": True}
+
+    # На всякий случай
+    raise HTTPException(status_code=400, detail=f"Неизвестная фаза: {phase}")
+
+
+@app.get("/api/games/{code}/chat")
+def get_chat(code: str):
+    game = get_game_or_404(code)
+    # возвращаем последние 100 сообщений
+    chat = game.get("chat", [])
+    return chat[-100:]
+
+
+@app.post("/api/games/{code}/chat")
+def post_chat(code: str, msg_in: ChatMessageIn):
+    game = get_game_or_404(code)
+    # определим, бот это или нет, по списку игроков
+    is_bot = False
+    try:
+        p = get_player(game, msg_in.user_id)
+        is_bot = bool(p.get("is_bot", False))
+    except HTTPException:
+        pass
+
+    msg = {
+        "user_id": msg_in.user_id,
+        "name": msg_in.name,
+        "text": msg_in.text,
+        "ts": int(time.time() * 1000),
+        "is_bot": is_bot,
+    }
+    game.setdefault("chat", []).append(msg)
+    return {"ok": True}
 
 
 @app.post("/api/games/{code}/bot-turn")
-def bot_turn(code: str, body: BotTurnRequest):
+def bot_turn(code: str):
     """
-    Ход ИИ-бота.
-    Вход: user_id бота, phase ('day'/'night'), history (опционально).
-    Выход: одна команда: { action, target_id, reason }.
+    Кнопка «Сделать ход ботами» у хоста:
+    - если сейчас day -> запускаем ночь (night_mafia / night_detective / night_doctor / сразу day);
+    - если сейчас night_* -> пытаемся сделать ход тем ботом, у кого сейчас фаза.
     """
-    try:
-        game = registry.get(code)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    game = get_game_or_404(code)
 
-    player = next((p for p in game.players if p.user_id == body.user_id), None)
-    if not player:
-        raise HTTPException(status_code=404, detail="Игрок не найден в этой игре")
+    if not game.get("started"):
+        raise HTTPException(status_code=400, detail="Игра ещё не началась")
 
-    if not player.is_bot:
-        raise HTTPException(status_code=400, detail="Этот игрок не помечен как бот (is_bot=false)")
+    phase = game.get("phase", "day")
 
-    if not game.started:
-        raise HTTPException(status_code=400, detail="Игра ещё не запущена")
+    # если день – просто запускаем ночь
+    if phase == "day":
+        start_night(game)
+        return game_summary(game)
 
-    try:
-        command = generate_ai_command(game, player, body.phase, body.history)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Ошибка при генерации хода ИИ: {exc}")
+    assignments: Dict[str, str] = game.get("assignments", {})
+    current_actor_id = game.get("current_actor_id")
 
-    # Пока просто возвращаем команду, не применяя к состоянию игры
-    return {"command": command}
+    # определим роль, у которой сейчас ход
+    phase_role_map = {
+        "night_mafia": "Мафия",
+        "night_detective": "Детектив",
+        "night_doctor": "Доктор",
+    }
+    role_needed = phase_role_map.get(phase)
+    if not role_needed:
+        return game_summary(game)
+
+    # найдём бота с такой ролью
+    bot_player: Optional[Player] = None
+    for uid_str, role in assignments.items():
+        if role != role_needed:
+            continue
+        uid = int(uid_str)
+        for p in game["players"]:
+            if p["user_id"] == uid and p.get("alive", True) and p.get("is_bot", False):
+                bot_player = p
+                break
+        if bot_player:
+            break
+
+    if not bot_player:
+        # нет бота для этой роли – ничего не делаем
+        return game_summary(game)
+
+    # если current_actor_id не совпадает – выставим его на бота
+    game["current_actor_id"] = bot_player["user_id"]
+
+    # получить действие от бота (ИИ или рандом)
+    decision = ai_bot_action(game, bot_player)
+    if not decision:
+        return game_summary(game)
+
+    action = decision["action"]
+    target_id = decision["target_id"]
+
+    # прогоняем через ту же логику, что и ручной ход
+    _ = game_action(
+        code,
+        ActionRequest(
+            user_id=bot_player["user_id"],
+            action=action,
+            target_id=target_id,
+        ),
+    )
+
+    return game_summary(game)
+
+
+# корневой маршрут, просто чтобы проверить, что сервер жив
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Mafia backend is running"}
