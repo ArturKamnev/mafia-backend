@@ -108,6 +108,8 @@ def game_summary(game: GameState) -> Dict[str, Any]:
         "round": game.get("round", 1),
         "current_actor_id": game.get("current_actor_id"),
         "events": game.get("events", []),
+        "winner": game.get("winner"),
+        "day_votes": game.get("day_votes", {}),
     }
 
 
@@ -123,6 +125,13 @@ def get_player(game: GameState, user_id: int) -> Player:
         if p["user_id"] == user_id:
             return p
     raise HTTPException(status_code=404, detail="Игрок не найден в этой игре")
+
+
+def get_alive_player(game: GameState, user_id: int) -> Player:
+    player = get_player(game, user_id)
+    if not player.get("alive", True):
+        raise HTTPException(status_code=400, detail="Цель уже мертва")
+    return player
 
 
 def get_alive_players(game: GameState) -> List[Player]:
@@ -148,6 +157,56 @@ def ensure_basic_roles(roles: List[str]) -> List[str]:
     if "Мирный житель" not in roles:
         roles.append("Мирный житель")
     return roles
+
+
+def check_winner(game: GameState) -> Optional[str]:
+    alive_players = get_alive_players(game)
+    if not alive_players:
+        return None
+
+    assignments: Dict[str, str] = game.get("assignments", {})
+    mafia_alive = [p for p in alive_players if assignments.get(str(p["user_id"])) == "Мафия"]
+    civilians_alive = [p for p in alive_players if assignments.get(str(p["user_id"])) != "Мафия"]
+
+    if not mafia_alive:
+        return "citizens"
+    if len(mafia_alive) >= len(civilians_alive):
+        return "mafia"
+    return None
+
+
+def resolve_day_votes(game: GameState):
+    """Закрывает дневное голосование, исключая игрока при большинстве голосов."""
+    if game.get("phase") != "day":
+        return
+
+    votes = game.get("day_votes") or {}
+    if not votes:
+        return
+
+    tally: Dict[int, int] = {}
+    for voter, target_id in votes.items():
+        tally[target_id] = tally.get(target_id, 0) + 1
+
+    max_votes = max(tally.values())
+    leaders = [uid for uid, count in tally.items() if count == max_votes]
+    if len(leaders) == 1:
+        try:
+            victim = get_alive_player(game, leaders[0])
+            victim["alive"] = False
+            game.setdefault("events", []).append(
+                {"type": "voted_out", "user_id": leaders[0], "votes": max_votes}
+            )
+        except HTTPException:
+            pass
+
+    winner = check_winner(game)
+    if winner:
+        game["phase"] = "finished"
+        game["winner"] = winner
+        game["current_actor_id"] = None
+
+    game["day_votes"] = {}
 
 
 def assign_roles(game: GameState) -> Dict[str, str]:
@@ -182,6 +241,10 @@ def assign_roles(game: GameState) -> Dict[str, str]:
 
 def start_night(game: GameState):
     """Перевод дня в ночь. Вызывается, например, из /bot-turn, когда фаза = day."""
+    resolve_day_votes(game)
+    if game.get("phase") == "finished":
+        return
+
     game["night_state"] = {
         "kill_target": None,
         "heal_target": None,
@@ -253,17 +316,26 @@ def resolve_night_and_go_day(game: GameState):
         else:
             # убиваем игрока
             try:
-                victim = get_player(game, kill_target)
+                victim = get_alive_player(game, kill_target)
                 victim["alive"] = False
             except HTTPException:
                 pass
             events.append({"type": "killed", "user_id": kill_target})
 
     game["events"] = events
+    game["night_state"] = {}
+
+    winner = check_winner(game)
+    if winner:
+        game["phase"] = "finished"
+        game["winner"] = winner
+        game["current_actor_id"] = None
+        return
+
     game["phase"] = "day"
     game["round"] = game.get("round", 1) + 1
     game["current_actor_id"] = None
-    game["night_state"] = {}
+    game["day_votes"] = {}
 
 
 def random_bot_action(game: GameState, bot_player: Player) -> Optional[Dict[str, Any]]:
@@ -385,6 +457,8 @@ def create_game(req: CreateGameRequest):
         "events": [],
         "chat": [],
         "night_state": {},
+        "day_votes": {},
+        "winner": None,
     }
     games[code] = game
     return game_summary(game)
@@ -442,6 +516,8 @@ def start_game(code: str):
             "host_id": game["host_id"],
             "started": True,
             "slots": game["slots"],
+            "winner": game.get("winner"),
+            "day_votes": game.get("day_votes", {}),
         }
 
     if len(game["players"]) < 4:
@@ -456,6 +532,8 @@ def start_game(code: str):
     game["current_actor_id"] = None
     game["events"] = []
     game["night_state"] = {}
+    game["day_votes"] = {}
+    game["winner"] = None
 
     return {
         "code": code,
@@ -467,6 +545,8 @@ def start_game(code: str):
         "host_id": game["host_id"],
         "started": True,
         "slots": game["slots"],
+        "winner": game.get("winner"),
+        "day_votes": game.get("day_votes", {}),
     }
 
 
@@ -477,6 +557,9 @@ def game_action(code: str, req: ActionRequest):
     if not game.get("started"):
         raise HTTPException(status_code=400, detail="Игра ещё не началась")
 
+    if game.get("phase") == "finished":
+        raise HTTPException(status_code=400, detail="Игра уже завершена")
+
     player = get_player(game, req.user_id)
     if not player.get("alive", True):
         raise HTTPException(status_code=400, detail="Мёртвые не ходят 🙂")
@@ -486,12 +569,14 @@ def game_action(code: str, req: ActionRequest):
     role = assignments.get(str(req.user_id))
 
     if phase == "day":
-        # Днём просто фиксим факт голосования (без логики вылета)
-        if req.action == "vote" and req.target_id is not None:
-            game["events"].append(
-                {"type": "voted", "user_id": req.user_id, "target_id": req.target_id}
-            )
-        return {"ok": True}
+        if req.action != "vote" or req.target_id is None:
+            raise HTTPException(status_code=400, detail="Доступно только голосование с target_id")
+        target = get_alive_player(game, req.target_id)
+        game.setdefault("day_votes", {})[str(req.user_id)] = target["user_id"]
+        game["events"].append(
+            {"type": "voted", "user_id": req.user_id, "target_id": target["user_id"]}
+        )
+        return {"ok": True, "votes": game.get("day_votes", {})}
 
     if phase == "night_mafia":
         if role != "Мафия":
@@ -500,7 +585,7 @@ def game_action(code: str, req: ActionRequest):
             raise HTTPException(status_code=403, detail="Сейчас ход другого игрока")
         if req.action != "kill" or req.target_id is None:
             raise HTTPException(status_code=400, detail="Ожидалось действие 'kill' с target_id")
-        get_player(game, req.target_id)  # проверим, что цель существует
+        get_alive_player(game, req.target_id)
         # просто запоминаем цель, но не убиваем сейчас
         game.setdefault("night_state", {})["kill_target"] = req.target_id
         # после мафии идём к детективу/доктору/дню
@@ -515,7 +600,7 @@ def game_action(code: str, req: ActionRequest):
         if req.action != "check" or req.target_id is None:
             raise HTTPException(status_code=400, detail="Ожидалось действие 'check' с target_id")
 
-        get_player(game, req.target_id)
+        get_alive_player(game, req.target_id)
         game.setdefault("night_state", {})["detective_target"] = req.target_id
         goto_next_phase_after_detective(game)
         return {"ok": True}
@@ -528,7 +613,7 @@ def game_action(code: str, req: ActionRequest):
         if req.action != "heal" or req.target_id is None:
             raise HTTPException(status_code=400, detail="Ожидалось действие 'heal' с target_id")
 
-        get_player(game, req.target_id)
+        get_alive_player(game, req.target_id)
         game.setdefault("night_state", {})["heal_target"] = req.target_id
         resolve_night_and_go_day(game)
         return {"ok": True}
@@ -578,6 +663,9 @@ def bot_turn(code: str):
 
     if not game.get("started"):
         raise HTTPException(status_code=400, detail="Игра ещё не началась")
+
+    if game.get("phase") == "finished":
+        return game_summary(game)
 
     phase = game.get("phase", "day")
 
